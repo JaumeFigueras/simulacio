@@ -16,8 +16,20 @@ data = data + np.random.uniform(low=-0.5, high=0.5, size=1000)
 data = np.maximum(data, 0)
 np.savetxt("data_1.csv", data)
 
+# Generate synthetic data: Exponential
+np.random.seed(0)
+data = np.random.exponential(scale=10, size=1000)
+np.savetxt("data_expo_sintetica.csv", data)
+
+# Generate synthetic data: Exponential
+np.random.seed(0)
+data = np.random.exponential(scale=10, size=1000)
+data = data + 5
+np.savetxt("data_expo_sintetica_5.csv", data)
+
+
 # Generate synthetic data: Normal Truncated
 np.random.seed(0)
 data = np.random.exponential(scale=10, size=1000)
 data = data + np.random.uniform(low=0, high=1, size=1000)
-np.savetxt("data_2.csv", data)
+np.savetxt("data_expo_real.csv", data)
