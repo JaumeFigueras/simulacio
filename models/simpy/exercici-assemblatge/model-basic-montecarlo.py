@@ -43,7 +43,7 @@ AssemblyModel = _model_module.AssemblyModel
 
 # Default experiment parameters
 DEFAULT_N_REPLICATIONS = 10
-DEFAULT_SIM_TIME = 800*60
+DEFAULT_SIM_TIME = 5000.0
 DEFAULT_CONFIDENCE_LEVEL = 0.95
 DEFAULT_BASE_SEED = 1000
 
@@ -166,7 +166,7 @@ def run_experiment(n_replications: int = DEFAULT_N_REPLICATIONS,
     # Run all replications
     all_results = []
     for i in range(n_replications):
-        seed = base_seed + i
+        seed = base_seed + i * 100
         print(f"\n  Running replication {i + 1}/{n_replications} "
               f"(seed={seed})...", end="")
         result = run_single_replication(seed, sim_time)
@@ -227,23 +227,33 @@ def print_results(results_df: pd.DataFrame, ci_df: pd.DataFrame,
     # Resource utilization
     util_metrics = ['util_paint', 'util_unpack', 'util_assembly']
 
-    # Queue waiting times
-    wait_metrics = ['wait_paint', 'wait_unpack', 'wait_assembly']
+    # Station queue waiting times
+    wait_station_metrics = ['wait_paint', 'wait_unpack', 'wait_assembly']
 
-    # Queue lengths (station queues)
+    # Station queue lengths
     qlen_station_metrics = ['qlen_paint', 'qlen_unpack', 'qlen_assembly']
 
-    # Queue lengths (inter-stage queues)
+    # Inter-stage queue waiting times
+    wait_stage_metrics = [
+        'wait_sup_covers', 'wait_inf_covers', 'wait_int_elements',
+    ]
+
+    # Inter-stage queue lengths
     qlen_stage_metrics = [
         'qlen_sup_covers', 'qlen_inf_covers', 'qlen_int_elements',
     ]
 
+    # Work in Progress
+    wip_metrics = ['wip_covers', 'wip_elements', 'wip_total']
+
     sections = [
         ("PARTS COUNTERS", counter_metrics),
         ("RESOURCE UTILIZATION", util_metrics),
-        ("QUEUE AVERAGE WAITING TIMES (minutes)", wait_metrics),
-        ("STATION QUEUE AVERAGE LENGTHS (entities)", qlen_station_metrics),
-        ("INTER-STAGE QUEUE AVERAGE LENGTHS (entities)", qlen_stage_metrics),
+        ("STATION QUEUE AVG WAITING TIMES (minutes)", wait_station_metrics),
+        ("STATION QUEUE AVG LENGTHS (entities)", qlen_station_metrics),
+        ("INTER-STAGE QUEUE AVG WAITING TIMES (minutes)", wait_stage_metrics),
+        ("INTER-STAGE QUEUE AVG LENGTHS (entities)", qlen_stage_metrics),
+        ("WORK IN PROGRESS (avg entities)", wip_metrics),
     ]
 
     header = (f"  {'Metric':<25s} {'Mean':>10s} {'Std':>10s} "

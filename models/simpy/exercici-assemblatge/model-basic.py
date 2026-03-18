@@ -42,6 +42,9 @@ class Cover:
     ready_at : float or None
         Simulation time at which this cover passed quality control,
         or ``None`` if not yet ready.
+    queue_entry_time : float or None
+        Simulation time at which this cover entered the inter-stage
+        queue, or ``None`` if not yet queued.
     """
 
     id: int
@@ -49,6 +52,7 @@ class Cover:
     created_at: float = 0.0
     paint_attempts: int = 0
     ready_at: Optional[float] = None
+    queue_entry_time: Optional[float] = None
 
     def __str__(self) -> str:
         """
@@ -78,12 +82,16 @@ class InteriorElement:
     ready_at : float or None
         Simulation time at which this element passed inspection,
         or ``None`` if not yet inspected or scrapped.
+    queue_entry_time : float or None
+        Simulation time at which this element entered the inter-stage
+        queue, or ``None`` if not yet queued.
     """
 
     id: int
     box_id: int
     created_at: float = 0.0
     ready_at: Optional[float] = None
+    queue_entry_time: Optional[float] = None
 
     def __str__(self) -> str:
         """
@@ -333,11 +341,13 @@ class StationStats:
 
 class QueueStats:
     """
-    Tracks time-weighted average length and maximum length for a
-    ``simpy.Store`` queue.
+    Tracks time-weighted average length, maximum length, and average
+    waiting time for a ``simpy.Store`` inter-stage queue.
 
-    Call ``record_change`` every time an item is added to or removed
-    from the queue.
+    Call ``record_put`` when an item is added to the queue, and
+    ``record_get`` when an item is removed.  Items must carry a
+    ``queue_entry_time`` attribute that is set before ``record_put``
+    is called.
 
     Attributes
     ----------
@@ -345,33 +355,64 @@ class QueueStats:
         Current number of items in the queue.
     max_length : int
         Maximum observed queue length during the simulation.
+    total_wait_time : float
+        Cumulative time items have spent waiting in the queue.
+    wait_count : int
+        Total number of items that have been retrieved from the queue.
     """
 
     def __init__(self):
         """
         Initialize all statistics accumulators to zero.
         """
+        # Time-weighted average queue length (area-under-the-curve)
         self.current_length: int = 0
         self._last_change_time: float = 0.0
         self._length_area: float = 0.0
         self.max_length: int = 0
 
-    def record_change(self, now: float, new_length: int) -> None:
+        # Queue waiting times
+        self.total_wait_time: float = 0.0
+        self.wait_count: int = 0
+
+    def record_put(self, now: float) -> None:
         """
-        Update the area-under-the-curve and set the new queue level.
+        Record that an item has been added to the queue.
+
+        The item's ``queue_entry_time`` attribute must be set to
+        ``now`` **before** calling this method.
 
         Parameters
         ----------
         now : float
             Current simulation time.
-        new_length : int
-            New number of items in the queue after the change.
         """
         self._length_area += self.current_length * (now - self._last_change_time)
-        self.current_length = new_length
+        self.current_length += 1
         self._last_change_time = now
-        if new_length > self.max_length:
-            self.max_length = new_length
+        if self.current_length > self.max_length:
+            self.max_length = self.current_length
+
+    def record_get(self, now: float, entry_time: float) -> None:
+        """
+        Record that an item has been removed from the queue.
+
+        Parameters
+        ----------
+        now : float
+            Current simulation time.
+        entry_time : float
+            The simulation time at which the item entered the queue
+            (i.e., the item's ``queue_entry_time`` attribute).
+        """
+        # Update queue length area
+        self._length_area += self.current_length * (now - self._last_change_time)
+        self.current_length -= 1
+        self._last_change_time = now
+
+        # Update waiting time
+        self.total_wait_time += now - entry_time
+        self.wait_count += 1
 
     def avg_length(self, sim_time: float) -> float:
         """
@@ -391,6 +432,109 @@ class QueueStats:
             return 0.0
         total_area = (self._length_area
                       + self.current_length * (sim_time - self._last_change_time))
+        return total_area / sim_time
+
+    def avg_wait_time(self) -> float:
+        """
+        Compute the average time items waited in the queue.
+
+        Returns
+        -------
+        float
+            Average wait time in minutes.  Returns 0.0 if no items
+            have been retrieved yet.
+        """
+        if self.wait_count == 0:
+            return 0.0
+        return self.total_wait_time / self.wait_count
+
+
+class WipStats:
+    """
+    Tracks time-weighted average Work in Progress (WIP) for a
+    category of entities.
+
+    WIP represents the number of entities currently in the system
+    (from arrival to departure).  An entity enters WIP when it
+    arrives and leaves WIP when it is consumed (assembled) or
+    discarded (scrapped).
+
+    Uses the area-under-the-curve method for time-weighted averaging.
+
+    Attributes
+    ----------
+    current_wip : int
+        Current number of entities in progress.
+    max_wip : int
+        Maximum observed WIP during the simulation.
+
+    Examples
+    --------
+    Typical usage::
+
+        wip.record_entry(env.now)   # entity arrives / enters the system
+        # ... entity flows through stations ...
+        wip.record_exit(env.now)    # entity is consumed or scrapped
+    """
+
+    def __init__(self):
+        """
+        Initialize all WIP accumulators to zero.
+        """
+        self.current_wip: int = 0
+        self._last_change_time: float = 0.0
+        self._wip_area: float = 0.0
+        self.max_wip: int = 0
+
+    def record_entry(self, now: float) -> None:
+        """
+        Record that an entity has entered the system (WIP increases).
+
+        Parameters
+        ----------
+        now : float
+            Current simulation time.
+        """
+        self._wip_area += self.current_wip * (now - self._last_change_time)
+        self.current_wip += 1
+        self._last_change_time = now
+        if self.current_wip > self.max_wip:
+            self.max_wip = self.current_wip
+
+    def record_exit(self, now: float) -> None:
+        """
+        Record that an entity has left the system (WIP decreases).
+
+        Called when an entity is consumed by assembly or discarded
+        as scrap.
+
+        Parameters
+        ----------
+        now : float
+            Current simulation time.
+        """
+        self._wip_area += self.current_wip * (now - self._last_change_time)
+        self.current_wip -= 1
+        self._last_change_time = now
+
+    def avg_wip(self, sim_time: float) -> float:
+        """
+        Compute the time-weighted average WIP.
+
+        Parameters
+        ----------
+        sim_time : float
+            Total simulation time.
+
+        Returns
+        -------
+        float
+            Average number of entities in progress.
+        """
+        if sim_time <= 0:
+            return 0.0
+        total_area = (self._wip_area
+                      + self.current_wip * (sim_time - self._last_change_time))
         return total_area / sim_time
 
 
@@ -738,6 +882,12 @@ class AssemblyModel:
         Statistics tracker for the inferior cover queue.
     stats_queue_elem : QueueStats
         Statistics tracker for the interior element queue.
+    wip_covers : WipStats
+        WIP tracker for cover entities.
+    wip_elements : WipStats
+        WIP tracker for interior element entities.
+    wip_total : WipStats
+        WIP tracker for all entities combined.
     counter_cover : int
         Total number of covers generated.
     counter_box : int
@@ -778,6 +928,11 @@ class AssemblyModel:
         self.stats_queue_sup = QueueStats()
         self.stats_queue_inf = QueueStats()
         self.stats_queue_elem = QueueStats()
+
+        # WIP statistics
+        self.wip_covers = WipStats()
+        self.wip_elements = WipStats()
+        self.wip_total = WipStats()
 
         # Counters
         self.counter_cover: int = 0
@@ -824,6 +979,10 @@ class AssemblyModel:
                          created_at=self.environ.now)
             self._log(f"  [{self.environ.now:7.2f}] Arrival {cover}")
 
+            # WIP: cover enters the system
+            self.wip_covers.record_entry(self.environ.now)
+            self.wip_total.record_entry(self.environ.now)
+
             # Launch the painting process for this cover
             self.environ.process(self.process_paint(cover))
 
@@ -847,6 +1006,11 @@ class AssemblyModel:
             box = InteriorElementsBox(id=self.counter_box,
                                         created_at=self.environ.now)
             self._log(f"  [{self.environ.now:7.2f}] Arrival {box}")
+
+            # WIP: all elements in the box enter the system
+            for _ in range(box.num_elements):
+                self.wip_elements.record_entry(self.environ.now)
+                self.wip_total.record_entry(self.environ.now)
 
             # Launch the unpacking process for this box
             self.environ.process(self.process_unpacking(box))
@@ -876,15 +1040,15 @@ class AssemblyModel:
         self._log(f"  [{self.environ.now:7.2f}] {cover} painted OK "
                   f"(attempts: {cover.paint_attempts})")
 
-        # Place in the appropriate queue and update queue stats
+        # Stamp queue entry time on the entity and update queue stats
+        cover.queue_entry_time = self.environ.now
+
         if cover.cover_type == 'superior':
             self.queue_superior_cover.put(cover)
-            self.stats_queue_sup.record_change(
-                self.environ.now, len(self.queue_superior_cover.items))
+            self.stats_queue_sup.record_put(self.environ.now)
         else:
             self.queue_inferior_cover.put(cover)
-            self.stats_queue_inf.record_change(
-                self.environ.now, len(self.queue_inferior_cover.items))
+            self.stats_queue_inf.record_put(self.environ.now)
 
     def process_unpacking(self, box: InteriorElementsBox):
         """
@@ -892,6 +1056,7 @@ class AssemblyModel:
 
         Delegates unpacking and inspection to the ``UnpackingStation``,
         then places each element that passed inspection into the queue.
+        Scrapped elements are recorded as WIP exits.
 
         Parameters
         ----------
@@ -906,11 +1071,18 @@ class AssemblyModel:
         good_elements = yield self.environ.process(
             self.unpack.unpack(box))
 
+        # Count scrapped elements and record WIP exits for them
+        num_scrapped = box.num_elements - len(good_elements)
+        for _ in range(num_scrapped):
+            self.wip_elements.record_exit(self.environ.now)
+            self.wip_total.record_exit(self.environ.now)
+
         for elem in good_elements:
             self._log(f"  [{self.environ.now:7.2f}] {elem} OK → queue")
+            # Stamp queue entry time on the entity and update queue stats
+            elem.queue_entry_time = self.environ.now
             self.queue_interior_element.put(elem)
-            self.stats_queue_elem.record_change(
-                self.environ.now, len(self.queue_interior_element.items))
+            self.stats_queue_elem.record_put(self.environ.now)
 
     def process_assembly(self):
         """
@@ -919,6 +1091,7 @@ class AssemblyModel:
         Waits for one superior cover, one inferior cover, and one
         interior element to become available in their respective
         queues, then delegates assembly to the ``AssemblyStation``.
+        Upon completion, all three components exit WIP.
         Uses ``simpy.Store.get()`` which blocks until an item is
         available.
 
@@ -928,18 +1101,18 @@ class AssemblyModel:
             SimPy store get events and process events.
         """
         while True:
-            # Wait for all three components
+            # Wait for all three components and record queue retrievals
             cover_sup = yield self.queue_superior_cover.get()
-            self.stats_queue_sup.record_change(
-                self.environ.now, len(self.queue_superior_cover.items))
+            self.stats_queue_sup.record_get(
+                self.environ.now, cover_sup.queue_entry_time)
 
             cover_inf = yield self.queue_inferior_cover.get()
-            self.stats_queue_inf.record_change(
-                self.environ.now, len(self.queue_inferior_cover.items))
+            self.stats_queue_inf.record_get(
+                self.environ.now, cover_inf.queue_entry_time)
 
             interior_element = yield self.queue_interior_element.get()
-            self.stats_queue_elem.record_change(
-                self.environ.now, len(self.queue_interior_element.items))
+            self.stats_queue_elem.record_get(
+                self.environ.now, interior_element.queue_entry_time)
 
             self._log(f"  [{self.environ.now:7.2f}] Assembly started: "
                       f"{cover_sup}, {cover_inf}, {interior_element}")
@@ -949,6 +1122,14 @@ class AssemblyModel:
 
             self.finished_products.append(product)
             self._log(f"  [{self.environ.now:7.2f}] ✓ {product}")
+
+            # WIP: all three components leave the system
+            self.wip_covers.record_exit(self.environ.now)   # superior
+            self.wip_covers.record_exit(self.environ.now)   # inferior
+            self.wip_elements.record_exit(self.environ.now)  # interior
+            self.wip_total.record_exit(self.environ.now)     # sup cover
+            self.wip_total.record_exit(self.environ.now)     # inf cover
+            self.wip_total.record_exit(self.environ.now)     # int element
 
     # ----- results extraction -----
 
@@ -982,23 +1163,35 @@ class AssemblyModel:
             - ``'util_unpack'`` : float
             - ``'util_assembly'`` : float
 
-            **Queue average waiting times** (minutes)
+            **Station queue average waiting times** (minutes)
 
             - ``'wait_paint'`` : float
             - ``'wait_unpack'`` : float
             - ``'wait_assembly'`` : float
 
-            **Queue average lengths** (entities)
+            **Station queue average lengths** (entities)
 
             - ``'qlen_paint'`` : float
             - ``'qlen_unpack'`` : float
             - ``'qlen_assembly'`` : float
+
+            **Inter-stage queue average waiting times** (minutes)
+
+            - ``'wait_sup_covers'`` : float
+            - ``'wait_inf_covers'`` : float
+            - ``'wait_int_elements'`` : float
 
             **Inter-stage queue average lengths** (entities)
 
             - ``'qlen_sup_covers'`` : float
             - ``'qlen_inf_covers'`` : float
             - ``'qlen_int_elements'`` : float
+
+            **Work in Progress** (time-weighted average entities)
+
+            - ``'wip_covers'`` : float
+            - ``'wip_elements'`` : float
+            - ``'wip_total'`` : float
         """
         t = self._sim_time
         return {
@@ -1015,18 +1208,26 @@ class AssemblyModel:
             'util_paint': self.paint.stats.utilization(t),
             'util_unpack': self.unpack.stats.utilization(t),
             'util_assembly': self.assembly.stats.utilization(t),
-            # Queue average waiting times
+            # Station queue average waiting times
             'wait_paint': self.paint.stats.avg_wait_time(),
             'wait_unpack': self.unpack.stats.avg_wait_time(),
             'wait_assembly': self.assembly.stats.avg_wait_time(),
-            # Queue average lengths
+            # Station queue average lengths
             'qlen_paint': self.paint.stats.avg_queue_length(t),
             'qlen_unpack': self.unpack.stats.avg_queue_length(t),
             'qlen_assembly': self.assembly.stats.avg_queue_length(t),
+            # Inter-stage queue average waiting times
+            'wait_sup_covers': self.stats_queue_sup.avg_wait_time(),
+            'wait_inf_covers': self.stats_queue_inf.avg_wait_time(),
+            'wait_int_elements': self.stats_queue_elem.avg_wait_time(),
             # Inter-stage queue average lengths
             'qlen_sup_covers': self.stats_queue_sup.avg_length(t),
             'qlen_inf_covers': self.stats_queue_inf.avg_length(t),
             'qlen_int_elements': self.stats_queue_elem.avg_length(t),
+            # Work in Progress
+            'wip_covers': self.wip_covers.avg_wip(t),
+            'wip_elements': self.wip_elements.avg_wip(t),
+            'wip_total': self.wip_total.avg_wip(t),
         }
 
     # ----- simulation entry point -----
@@ -1068,7 +1269,7 @@ class AssemblyModel:
 
         Displays production counters, resource utilization, average
         queue waiting times, average queue lengths (with maximums),
-        and inter-stage queue levels.
+        inter-stage queue levels and waiting times, and WIP statistics.
 
         Parameters
         ----------
@@ -1108,8 +1309,8 @@ class AssemblyModel:
         print(f"  Assembly station:               "
               f"{self.assembly.stats.utilization(sim_time) * 100:.1f}%")
 
-        # --- Average queue waiting times ---
-        print("\n  AVERAGE QUEUE WAITING TIMES (minutes)")
+        # --- Station queue average waiting times ---
+        print("\n  STATION QUEUE AVERAGE WAITING TIMES (minutes)")
         print("  " + "-" * 56)
         print(f"  Paint queue:                    "
               f"{self.paint.stats.avg_wait_time():.2f}")
@@ -1118,8 +1319,8 @@ class AssemblyModel:
         print(f"  Assembly queue:                 "
               f"{self.assembly.stats.avg_wait_time():.2f}")
 
-        # --- Average queue lengths ---
-        print("\n  AVERAGE QUEUE LENGTHS (entities)")
+        # --- Station queue average lengths ---
+        print("\n  STATION QUEUE AVERAGE LENGTHS (entities)")
         print("  " + "-" * 56)
         print(f"  Paint queue:                    "
               f"{self.paint.stats.avg_queue_length(sim_time):.2f}"
@@ -1130,6 +1331,16 @@ class AssemblyModel:
         print(f"  Assembly queue:                 "
               f"{self.assembly.stats.avg_queue_length(sim_time):.2f}"
               f"  (max: {self.assembly.stats.max_queue_length})")
+
+        # --- Inter-stage queue waiting times ---
+        print("\n  INTER-STAGE QUEUE AVERAGE WAITING TIMES (minutes)")
+        print("  " + "-" * 56)
+        print(f"  Superior covers:                "
+              f"{self.stats_queue_sup.avg_wait_time():.2f}")
+        print(f"  Inferior covers:                "
+              f"{self.stats_queue_inf.avg_wait_time():.2f}")
+        print(f"  Interior elements:              "
+              f"{self.stats_queue_elem.avg_wait_time():.2f}")
 
         # --- Inter-stage queue levels ---
         print("\n  INTER-STAGE QUEUE LEVELS (avg / max / final)")
@@ -1146,6 +1357,22 @@ class AssemblyModel:
               f"{self.stats_queue_elem.avg_length(sim_time):.2f}"
               f" / {self.stats_queue_elem.max_length}"
               f" / {len(self.queue_interior_element.items)}")
+
+        # --- Work in Progress ---
+        print("\n  WORK IN PROGRESS (time-weighted average / max / current)")
+        print("  " + "-" * 56)
+        print(f"  Covers WIP:                     "
+              f"{self.wip_covers.avg_wip(sim_time):.2f}"
+              f" / {self.wip_covers.max_wip}"
+              f" / {self.wip_covers.current_wip}")
+        print(f"  Interior elements WIP:          "
+              f"{self.wip_elements.avg_wip(sim_time):.2f}"
+              f" / {self.wip_elements.max_wip}"
+              f" / {self.wip_elements.current_wip}")
+        print(f"  Total WIP:                      "
+              f"{self.wip_total.avg_wip(sim_time):.2f}"
+              f" / {self.wip_total.max_wip}"
+              f" / {self.wip_total.current_wip}")
 
         print("\n" + "=" * 60)
 
