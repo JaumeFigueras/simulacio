@@ -3,11 +3,11 @@
 """
 Discrete-event simulation of a product assembly line using SimPy.
 
-Product = Tapa Superior + Tapa Inferior + Element Interior
+Product = Superior Cover + Inferior Cover + Interior Element
 
 Flows
 -----
-1. Tapes arrive Exp(11 min), 50/50 superior/inferior.
+1. Covers arrive Exp(11 min), 50/50 superior/inferior.
    Painted Uniform(6,12) min, 95% pass QC, 5% rework (re-enter FIFO queue).
 2. Interior elements arrive in boxes of 3, Exp(64 min).
    Unpacked Uniform(30,50) min. 10% defective → scrap.
@@ -76,6 +76,104 @@ class FinalProduct:
 
 
 # ---------------------------------------------------------------------------
+# Statistics helpers
+# ---------------------------------------------------------------------------
+
+class StationStats:
+    """
+    Tracks resource utilization, queue waiting times, and time-weighted
+    average queue length for a single-server station.
+    """
+
+    def __init__(self):
+        # Resource utilization
+        self.total_busy_time: float = 0.0
+        self._busy_start: Optional[float] = None
+
+        # Queue waiting time
+        self.total_wait_time: float = 0.0
+        self.wait_count: int = 0
+        self._wait_starts: dict = {}
+
+        # Time-weighted queue length
+        self.current_queue_length: int = 0
+        self._last_change_time: float = 0.0
+        self._total_area: float = 0.0
+
+    def record_queue_entry(self, now: float, entity_id: int):
+        """Called when an entity joins the queue (before yield req)."""
+        self._update_area(now)
+        self.current_queue_length += 1
+        self._wait_starts[entity_id] = now
+
+    def record_service_start(self, now: float, entity_id: int):
+        """Called when service begins (after yield req)."""
+        self._update_area(now)
+        self.current_queue_length -= 1
+        if entity_id in self._wait_starts:
+            wait_time = now - self._wait_starts.pop(entity_id)
+            self.total_wait_time += wait_time
+            self.wait_count += 1
+        self._busy_start = now
+
+    def record_service_end(self, now: float):
+        """Called when service completes."""
+        if self._busy_start is not None:
+            self.total_busy_time += now - self._busy_start
+            self._busy_start = None
+
+    def _update_area(self, now: float):
+        self._total_area += self.current_queue_length * (now - self._last_change_time)
+        self._last_change_time = now
+
+    def utilization(self, sim_time: float) -> float:
+        """Returns resource utilization as a fraction [0, 1]."""
+        if sim_time <= 0:
+            return 0.0
+        return self.total_busy_time / sim_time
+
+    def average_wait_time(self) -> float:
+        """Returns average wait time in queue (minutes)."""
+        if self.wait_count == 0:
+            return 0.0
+        return self.total_wait_time / self.wait_count
+
+    def average_queue_length(self, sim_time: float) -> float:
+        """Returns time-weighted average queue length."""
+        if sim_time <= 0:
+            return 0.0
+        total = self._total_area + self.current_queue_length * (sim_time - self._last_change_time)
+        return total / sim_time
+
+
+class BufferStats:
+    """
+    Tracks time-weighted average length and maximum length for a simpy.Store buffer.
+    """
+
+    def __init__(self):
+        self.current_length: int = 0
+        self._last_change_time: float = 0.0
+        self._total_area: float = 0.0
+        self.max_length: int = 0
+
+    def record_change(self, now: float, new_length: int):
+        """Update area accumulator and current length."""
+        self._total_area += self.current_length * (now - self._last_change_time)
+        self._last_change_time = now
+        self.current_length = new_length
+        if new_length > self.max_length:
+            self.max_length = new_length
+
+    def average_length(self, sim_time: float) -> float:
+        """Returns time-weighted average length."""
+        if sim_time <= 0:
+            return 0.0
+        total = self._total_area + self.current_length * (sim_time - self._last_change_time)
+        return total / sim_time
+
+
+# ---------------------------------------------------------------------------
 # Resource / Station classes
 # ---------------------------------------------------------------------------
 
@@ -91,15 +189,19 @@ class PaintStation:
         self.resource = simpy.Resource(environ, capacity=capacity)
         self.painted_covers: int = 0
         self.reworked_covers: int = 0
+        self.stats = StationStats()
 
     def paint(self, cover: Cover):
         """SimPy process: request resource, paint, check QC."""
         while True:
             cover.paint_attempts += 1
             with self.resource.request() as req:
+                self.stats.record_queue_entry(self.environ.now, id(cover))
                 yield req
+                self.stats.record_service_start(self.environ.now, id(cover))
                 paint_time = random.uniform(6, 12)
                 yield self.environ.timeout(paint_time)
+                self.stats.record_service_end(self.environ.now)
                 self.painted_covers += 1
 
             # Quality control
@@ -111,7 +213,7 @@ class PaintStation:
                 # Defective → rework (re-enters the FIFO queue)
                 self.reworked_covers += 1
                 print(f"  [{self.environ.now:7.2f}] {cover} REWORK "
-                      f"(intent {cover.paint_attempts})")
+                      f"(attempt {cover.paint_attempts})")
 
 
 class UnpackingStation:
@@ -127,13 +229,17 @@ class UnpackingStation:
         self.boxes_unpacked: int = 0
         self.elements_ok: int = 0
         self.elements_scrap: int = 0
+        self.stats = StationStats()
 
     def unpack(self, box: InteriorElementsBox):
         """SimPy process: unpack a box and return a list of good elements."""
         with self.resource.request() as req:
+            self.stats.record_queue_entry(self.environ.now, id(box))
             yield req
+            self.stats.record_service_start(self.environ.now, id(box))
             unpack_time = random.uniform(30, 50)
             yield self.environ.timeout(unpack_time)
+            self.stats.record_service_end(self.environ.now)
             self.boxes_unpacked += 1
 
         # Inspect each element
@@ -159,21 +265,26 @@ class AssemblyStation:
     """
     Assembly station with a single machine (SimPy Resource).
     Assembly time ~ Uniform(10, 20) min.
-    Requires 1 tapa superior + 1 tapa inferior + 1 element interior.
+    Requires 1 superior cover + 1 inferior cover + 1 interior element.
     """
 
     def __init__(self, environ: simpy.Environment, capacity: int = 1):
         self.environ = environ
         self.resource = simpy.Resource(environ, capacity=capacity)
         self.products_assembled: int = 0
+        self.stats = StationStats()
 
     def assemble(self, tapa_sup: Cover, tapa_inf: Cover,
                  elem_int: InteriorElement) -> FinalProduct:
         """SimPy process: assemble one finished product."""
         with self.resource.request() as req:
+            entity_id = id(tapa_sup)
+            self.stats.record_queue_entry(self.environ.now, entity_id)
             yield req
+            self.stats.record_service_start(self.environ.now, entity_id)
             assembly_time = random.uniform(10, 20)
             yield self.environ.timeout(assembly_time)
+            self.stats.record_service_end(self.environ.now)
             self.products_assembled += 1
 
         product = FinalProduct(
@@ -212,6 +323,11 @@ class AssemblyModel:
         self.queue_inferior_cover: simpy.Store = simpy.Store(environ)
         self.queue_interior_element: simpy.Store = simpy.Store(environ)
 
+        # Buffer statistics
+        self.stats_superior_cover = BufferStats()
+        self.stats_inferior_cover = BufferStats()
+        self.stats_interior_element = BufferStats()
+
         # Counters
         self.counter_cover: int = 0
         self.counter_box: int = 0
@@ -220,7 +336,7 @@ class AssemblyModel:
     # ----- generators (arrival processes) -----
 
     def arrival_cover(self):
-        """Generates tapes with Exp(11) inter-arrival, 50/50 sup/inf."""
+        """Generates covers with Exp(11) inter-arrival, 50/50 sup/inf."""
         while True:
             inter_arrival = random.expovariate(1.0 / 11.0)
             yield self.environ.timeout(inter_arrival)
@@ -251,16 +367,20 @@ class AssemblyModel:
     # ----- stage processes -----
 
     def process_paint(self, cover: Cover):
-        """Paint a tapa (with potential rework) and place it in the buffer."""
+        """Paint a cover (with potential rework) and place it in the buffer."""
         yield self.environ.process(self.paint.paint(cover))
 
-        print(f"  [{self.environ.now:7.2f}] {cover} pintada OK "
-              f"(intents: {cover.paint_attempts})")
+        print(f"  [{self.environ.now:7.2f}] {cover} painted OK "
+              f"(attempts: {cover.paint_attempts})")
 
         if cover.cover_type == 'superior':
-            self.queue_superior_cover.put(cover)
+            yield self.queue_superior_cover.put(cover)
+            self.stats_superior_cover.record_change(
+                self.environ.now, len(self.queue_superior_cover.items))
         else:
-            self.queue_inferior_cover.put(cover)
+            yield self.queue_inferior_cover.put(cover)
+            self.stats_inferior_cover.record_change(
+                self.environ.now, len(self.queue_inferior_cover.items))
 
     def process_unpacking(self, box: InteriorElementsBox):
         """Unpack a box and place good elements in the buffer."""
@@ -269,7 +389,9 @@ class AssemblyModel:
 
         for elem in good_elements:
             print(f"  [{self.environ.now:7.2f}] {elem} OK → buffer")
-            self.queue_interior_element.put(elem)
+            yield self.queue_interior_element.put(elem)
+            self.stats_interior_element.record_change(
+                self.environ.now, len(self.queue_interior_element.items))
 
     def process_assembly(self):
         """
@@ -280,8 +402,14 @@ class AssemblyModel:
             # Wait for all three components (order does not matter,
             # but each get blocks independently)
             cover_sup = yield self.queue_superior_cover.get()
+            self.stats_superior_cover.record_change(
+                self.environ.now, len(self.queue_superior_cover.items))
             cover_inf = yield self.queue_inferior_cover.get()
+            self.stats_inferior_cover.record_change(
+                self.environ.now, len(self.queue_inferior_cover.items))
             interior_element = yield self.queue_interior_element.get()
+            self.stats_interior_element.record_change(
+                self.environ.now, len(self.queue_interior_element.items))
 
             print(f"  [{self.environ.now:7.2f}] Assembly started: "
                   f"{cover_sup}, {cover_inf}, {interior_element}")
@@ -303,7 +431,7 @@ class AssemblyModel:
         self.environ.process(self.process_assembly())
 
         # Run
-        print(f"=== Simulació d'assemblatge – durada {until} min ===\n")
+        print(f"=== Assembly simulation – duration {until} min ===\n")
         self.environ.run(until=until)
 
         # Report
@@ -312,30 +440,69 @@ class AssemblyModel:
     def _print_report(self, sim_time: float):
         """Print summary statistics at the end of the simulation."""
         print("\n" + "=" * 60)
-        print("RESUM DE LA SIMULACIÓ")
+        print("SIMULATION SUMMARY")
         print("=" * 60)
-        print(f"  Temps simulat:                  {sim_time:.0f} min")
-        print(f"  Tapes generades:                {self.counter_cover}")
-        print(f"  Tapes pintades (total ops):     "
+        print(f"  Simulated time:                 {sim_time:.0f} min")
+        print(f"  Covers generated:               {self.counter_cover}")
+        print(f"  Covers painted (total ops):     "
               f"{self.paint.painted_covers}")
-        print(f"  Tapes retreballs:               "
+        print(f"  Covers reworked:                "
               f"{self.paint.reworked_covers}")
-        print(f"  Caixes rebudes:                 {self.counter_box}")
-        print(f"  Caixes desembalades:            "
+        print(f"  Boxes received:                 {self.counter_box}")
+        print(f"  Boxes unpacked:                 "
               f"{self.unpack.boxes_unpacked}")
-        print(f"  Elements interiors OK:          "
+        print(f"  Interior elements OK:           "
               f"{self.unpack.elements_ok}")
-        print(f"  Elements interiors descartats:  "
+        print(f"  Interior elements scrapped:     "
               f"{self.unpack.elements_scrap}")
-        print(f"  Productes acabats:              "
+        print(f"  Finished products:              "
               f"{len(self.finished_products)}")
 
         # Buffer levels at end of simulation
-        print(f"\n  Buffer tapes superiors (final): "
+        print(f"\n  Buffer superior covers (final): "
               f"{len(self.queue_superior_cover.items)}")
-        print(f"  Buffer tapes inferiors (final): "
+        print(f"  Buffer inferior covers (final): "
               f"{len(self.queue_inferior_cover.items)}")
-        print(f"  Buffer elements int. (final):   "
+        print(f"  Buffer interior elements (final): "
+              f"{len(self.queue_interior_element.items)}")
+
+        # Resource utilization
+        print(f"\n  {'RESOURCE UTILIZATION':}")
+        print(f"  {'Paint station:':25s}"
+              f"{self.paint.stats.utilization(sim_time) * 100:5.1f}%")
+        print(f"  {'Unpacking station:':25s}"
+              f"{self.unpack.stats.utilization(sim_time) * 100:5.1f}%")
+        print(f"  {'Assembly station:':25s}"
+              f"{self.assembly.stats.utilization(sim_time) * 100:5.1f}%")
+
+        # Average queue waiting times
+        print(f"\n  {'AVERAGE QUEUE WAITING TIMES (minutes)':}")
+        print(f"  {'Paint queue:':25s}"
+              f"{self.paint.stats.average_wait_time():7.2f}")
+        print(f"  {'Unpacking queue:':25s}"
+              f"{self.unpack.stats.average_wait_time():7.2f}")
+        print(f"  {'Assembly queue:':25s}"
+              f"{self.assembly.stats.average_wait_time():7.2f}")
+
+        # Average queue lengths
+        print(f"\n  {'AVERAGE QUEUE LENGTHS (entities)':}")
+        print(f"  {'Paint queue:':25s}"
+              f"{self.paint.stats.average_queue_length(sim_time):7.2f}")
+        print(f"  {'Unpacking queue:':25s}"
+              f"{self.unpack.stats.average_queue_length(sim_time):7.2f}")
+        print(f"  {'Assembly queue:':25s}"
+              f"{self.assembly.stats.average_queue_length(sim_time):7.2f}")
+
+        # Buffer levels (average / final)
+        print(f"\n  {'BUFFER LEVELS (average / final)':}")
+        print(f"  {'Superior covers:':25s}"
+              f"{self.stats_superior_cover.average_length(sim_time):5.2f} / "
+              f"{len(self.queue_superior_cover.items)}")
+        print(f"  {'Inferior covers:':25s}"
+              f"{self.stats_inferior_cover.average_length(sim_time):5.2f} / "
+              f"{len(self.queue_inferior_cover.items)}")
+        print(f"  {'Interior elements:':25s}"
+              f"{self.stats_interior_element.average_length(sim_time):5.2f} / "
               f"{len(self.queue_interior_element.items)}")
         print("=" * 60)
 
