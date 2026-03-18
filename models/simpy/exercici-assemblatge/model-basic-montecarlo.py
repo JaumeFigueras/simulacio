@@ -43,7 +43,7 @@ AssemblyModel = _model_module.AssemblyModel
 
 # Default experiment parameters
 DEFAULT_N_REPLICATIONS = 10
-DEFAULT_SIM_TIME = 80.0 * 60.0
+DEFAULT_SIM_TIME = 800*60
 DEFAULT_CONFIDENCE_LEVEL = 0.95
 DEFAULT_BASE_SEED = 1000
 
@@ -154,14 +154,14 @@ def run_experiment(n_replications: int = DEFAULT_N_REPLICATIONS,
     ci_df : pd.DataFrame
         Confidence intervals with one row per metric.
     """
-    print("=" * 70)
+    print("=" * 80)
     print("MONTE CARLO SIMULATION EXPERIMENT")
-    print("=" * 70)
+    print("=" * 80)
     print(f"  Replications:      {n_replications}")
     print(f"  Simulation time:   {sim_time:.0f} min per replication")
     print(f"  Confidence level:  {confidence * 100:.0f}%")
     print(f"  Base seed:         {base_seed}")
-    print("=" * 70)
+    print("=" * 80)
 
     # Run all replications
     all_results = []
@@ -206,9 +206,9 @@ def print_results(results_df: pd.DataFrame, ci_df: pd.DataFrame,
         Confidence level used (default is 0.95).
     """
     # --- Raw results per replication ---
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print("RAW RESULTS PER REPLICATION")
-    print("=" * 70)
+    print("=" * 80)
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', None)
     pd.set_option('display.float_format', '{:.4f}'.format)
@@ -246,16 +246,20 @@ def print_results(results_df: pd.DataFrame, ci_df: pd.DataFrame,
         ("INTER-STAGE QUEUE AVERAGE LENGTHS (entities)", qlen_stage_metrics),
     ]
 
-    print("\n" + "=" * 70)
+    header = (f"  {'Metric':<25s} {'Mean':>10s} {'Std':>10s} "
+              f"{'CI Lower':>10s} {'CI Upper':>10s} "
+              f"{'Half-W':>10s} {'Rel.Err%':>9s}")
+    separator = "  " + "-" * 76
+
+    print("\n" + "=" * 80)
     print(f"CONFIDENCE INTERVALS ({pct:.0f}%)")
-    print("=" * 70)
+    print("=" * 80)
 
     for section_title, metric_list in sections:
         print(f"\n  {section_title}")
-        print("  " + "-" * 66)
-        print(f"  {'Metric':<25s} {'Mean':>10s} {'Std':>10s} "
-              f"{'CI Lower':>10s} {'CI Upper':>10s} {'Rel.Err%':>9s}")
-        print("  " + "-" * 66)
+        print(separator)
+        print(header)
+        print(separator)
 
         for metric in metric_list:
             row = ci_df[ci_df['metric'] == metric].iloc[0]
@@ -265,15 +269,17 @@ def print_results(results_df: pd.DataFrame, ci_df: pd.DataFrame,
                       f"{row['std'] * 100:>9.2f}% "
                       f"{row['ci_lower'] * 100:>9.2f}% "
                       f"{row['ci_upper'] * 100:>9.2f}% "
+                      f"{row['half_width'] * 100:>9.2f}% "
                       f"{row['rel_error_pct']:>8.2f}%")
             else:
                 print(f"  {metric:<25s} {row['mean']:>10.2f} "
                       f"{row['std']:>10.2f} "
                       f"{row['ci_lower']:>10.2f} "
                       f"{row['ci_upper']:>10.2f} "
+                      f"{row['half_width']:>10.2f} "
                       f"{row['rel_error_pct']:>8.2f}%")
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
 
 
 # ---------------------------------------------------------------------------
